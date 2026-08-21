@@ -168,6 +168,22 @@
   }
   .leaflet-tooltip.sv-label::before{ display:none; }
   #map.hide-labels .sv-label{ display:none; }
+  .bva-num{
+    font-size:30px; font-weight:800; line-height:1.05; color:#fff;
+    text-shadow: 0 0 3px rgba(0,0,0,0.95), 0 0 4px rgba(0,0,0,0.95), 0 1px 2px rgba(0,0,0,0.95);
+    text-align:center; pointer-events:none;
+  }
+  .bva-num-clickable{
+    pointer-events:auto; cursor:pointer;
+    background:rgba(20,22,27,0.55); border:2px solid rgba(255,255,255,0.85);
+    border-radius:24px; padding:4px 14px; text-shadow:none;
+    box-shadow:0 3px 10px rgba(0,0,0,0.45);
+    white-space:nowrap;
+  }
+  .sv-label .sv-sub{
+    font-size:9px; font-weight:600; opacity:0.7; line-height:1;
+    text-shadow: 0 0 2px rgba(0,0,0,0.9), 0 1px 1px rgba(0,0,0,0.9);
+  }
 
   @media (max-width: 640px){
     .title-card{ max-width:calc(100vw - 32px); padding:12px 14px 10px;}
@@ -331,10 +347,58 @@ const ALL_ELECTIONS = {"order": ["gen2026-10-05", "gen2022-10-03", "part2022-04-
   }
 
   let activeLayer = null;
+  let activeGroupLayers = [];
+  let activeBvaLabel = null;
   let geoLayer = null;
+  let bvaLabelLayer = L.layerGroup().addTo(map);
+  let bvaOrigCenters = {};
   let currentMode = 'jour';
   function resetActive(){
     if(activeLayer){ activeLayer.setStyle(styleFeature(activeLayer.feature)); activeLayer = null; }
+    if(activeGroupLayers.length){
+      activeGroupLayers.forEach(function(m){ m.setStyle(styleFeature(m.feature)); });
+      activeGroupLayers = [];
+    }
+    activeBvaLabel = null;
+  }
+
+  function layoutBvaLabels(){
+    const labels = Object.keys(bvaOrigCenters);
+    if(!labels.length) return;
+    const pts = {};
+    labels.forEach(function(label){
+      pts[label] = map.latLngToContainerPoint(bvaOrigCenters[label]);
+    });
+    // Estimate pill width/height from the longest label at the current font size (30px, bold),
+    // plus horizontal padding (14px*2) and border (2px*2). Diagonal used as safety margin
+    // since labels are rectangular, not circular.
+    const maxChars = Math.max.apply(null, labels.map(function(l){ return l.length; }));
+    const estWidth = maxChars * 19 + 36; // approx pill width at 30px bold font + padding/border
+    const minDist = estWidth + 14;
+    for(let iter=0; iter<300; iter++){
+      let moved = false;
+      for(let i=0;i<labels.length;i++){
+        for(let j=i+1;j<labels.length;j++){
+          const a = pts[labels[i]], b = pts[labels[j]];
+          const dx = b.x-a.x, dy = b.y-a.y;
+          let dist = Math.sqrt(dx*dx+dy*dy);
+          if(dist < minDist){
+            moved = true;
+            if(dist < 0.01){ dist = minDist*0.1; }
+            const push = (minDist-dist)/2;
+            const ux = dx/dist, uy = dy/dist;
+            a.x -= ux*push; a.y -= uy*push;
+            b.x += ux*push; b.y += uy*push;
+          }
+        }
+      }
+      if(!moved) break;
+    }
+    bvaLabelLayer.eachLayer(function(marker){
+      if(marker._bvaLabelKey && pts[marker._bvaLabelKey]){
+        marker.setLatLng(map.containerPointToLatLng(pts[marker._bvaLabelKey]));
+      }
+    });
   }
 
   function buildLegend(gj){
@@ -369,6 +433,13 @@ const ALL_ELECTIONS = {"order": ["gen2026-10-05", "gen2022-10-03", "part2022-04-
     });
   }
 
+  function buildLabelHtml(props){
+    if(currentMode === 'anticipe'){
+      return '<span class="sv-sub">' + props.sv + '</span>';
+    }
+    return String(props.sv);
+  }
+
   function loadElection(id, fitView){
     const e = ALL_ELECTIONS.elections[id];
     detailPanel.classList.remove('open');
@@ -386,30 +457,88 @@ const ALL_ELECTIONS = {"order": ["gen2026-10-05", "gen2022-10-03", "part2022-04-
     const activeGeojson = currentMode === 'anticipe' ? e.geojson_anticipe : e.geojson;
 
     if(geoLayer){ map.removeLayer(geoLayer); }
+    const bvaGroups = {};
     geoLayer = L.geoJSON(activeGeojson, {
       style: styleFeature,
+      interactive: true,
       onEachFeature: function(feature, layer){
-        layer.on('mouseover', function(){
-          this.setStyle({ weight:2.5, color:'#f4efe1', fillOpacity: feature.properties.total_votes>0 ? 0.88 : 0.5 });
-          this.bringToFront();
-        });
-        layer.on('mouseout', function(){
-          if(activeLayer !== this){ this.setStyle(styleFeature(feature)); }
-        });
-        layer.on('click', function(){
-          resetActive();
-          activeLayer = this;
-          this.setStyle({ weight:3, color:'#ffffff', fillOpacity: feature.properties.total_votes>0 ? 0.9 : 0.55 });
-          this.bringToFront();
-          renderDetail(feature.properties);
-        });
-        layer.bindTooltip(String(feature.properties.sv), {
+        const label = feature.properties.bva_label;
+        if(currentMode === 'anticipe' && label){
+          if(!bvaGroups[label]) bvaGroups[label] = { members:[], props: feature.properties };
+          bvaGroups[label].members.push(layer);
+
+          layer.on('click', function(){
+            if(activeBvaLabel === label){
+              resetActive();
+              detailPanel.classList.remove('open');
+              return;
+            }
+            selectBvaGroup(label);
+          });
+        } else if(currentMode === 'jour'){
+          layer.on('click', function(){
+            if(activeLayer === this){
+              resetActive();
+              detailPanel.classList.remove('open');
+              return;
+            }
+            resetActive();
+            activeLayer = this;
+            this.setStyle({ weight:3, color:'#ffffff', fillOpacity: feature.properties.total_votes>0 ? 0.9 : 0.55 });
+            this.bringToFront();
+            renderDetail(feature.properties);
+          });
+        }
+        layer.bindTooltip(buildLabelHtml(feature.properties), {
           permanent: true, direction: 'center', className: 'sv-label', opacity: 1
         });
       }
     }).addTo(map);
 
+    function selectBvaGroup(label){
+      const g = bvaGroups[label];
+      if(!g) return;
+      resetActive();
+      g.members.forEach(function(m){
+        m.setStyle({ weight:3, color:'#ffffff', fillOpacity: g.props.total_votes>0 ? 0.9 : 0.55 });
+        m.bringToFront();
+      });
+      activeGroupLayers = g.members;
+      activeBvaLabel = label;
+      renderDetail(g.props);
+    }
+
     if(fitView){ map.fitBounds(geoLayer.getBounds(), { padding:[40,40] }); }
+
+    bvaLabelLayer.clearLayers();
+    activeGroupLayers = [];
+    bvaOrigCenters = {};
+    if(currentMode === 'anticipe'){
+      Object.keys(bvaGroups).forEach(function(label){
+        const g = bvaGroups[label];
+        let sumLat=0, sumLng=0;
+        g.members.forEach(function(m){ const c=m.getBounds().getCenter(); sumLat+=c.lat; sumLng+=c.lng; });
+        const center = L.latLng(sumLat/g.members.length, sumLng/g.members.length);
+        bvaOrigCenters[label] = center;
+        const icon = L.divIcon({
+          className: 'sv-label',
+          html: '<div class="bva-num bva-num-clickable">' + label + '</div>',
+          iconSize: [0,0]
+        });
+        const marker = L.marker(center, { icon: icon, interactive: true });
+        marker._bvaLabelKey = label;
+        marker.on('click', function(){
+          if(activeBvaLabel === label){
+            resetActive();
+            detailPanel.classList.remove('open');
+            return;
+          }
+          selectBvaGroup(label);
+        });
+        marker.addTo(bvaLabelLayer);
+      });
+      setTimeout(layoutBvaLabels, 0);
+    }
 
     document.getElementById('eyebrowType').textContent = 'Élections Québec · ' + e.type;
     const modeSuffix = currentMode === 'anticipe' ? ' — vote par anticipation (regroupé)' : ' — résultat par section de vote (jour du scrutin)';
@@ -423,6 +552,10 @@ const ALL_ELECTIONS = {"order": ["gen2026-10-05", "gen2022-10-03", "part2022-04-
     if(!btn || btn.disabled) return;
     currentMode = btn.dataset.mode;
     loadElection(document.getElementById('electionSelect').value, false);
+  });
+
+  map.on('zoomend', function(){
+    if(currentMode === 'anticipe'){ layoutBvaLabels(); }
   });
 
   // populate picker
